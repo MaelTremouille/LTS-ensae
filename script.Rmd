@@ -1,0 +1,355 @@
+---
+title: "Project - Linear Times Series"
+output:
+  html_document: default
+  pdf_document: default
+date: "2025-04-10"
+---
+https://www.insee.fr/fr/statistiques/serie/010767639#Graphique
+
+## Part 0: the prerequisites
+We first import all the packages that will be required for the following parts.
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#Set working directory
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+#Downloading packages
+list.of.packages <- c("readr", "zoo", "tseries", "stargazer", "fUnitRoots", "dplyr",
+                      "aTSA", "xtable", "forecast", "ellipse", "graphics", "knitr", 
+                      "rmarkdown", "markdown", "stargazer")
+
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages, repos = "http://cran.us.r-project.org")
+
+invisible(lapply(list.of.packages, library, character.only = TRUE))
+
+#Reset environment
+rm(list=ls())
+```
+
+## Part I: the data
+### Question 1
+We will first import the data :
+```{r imports}
+ts <- read.csv("valeurs_mensuelles.csv", sep = ";")
+ts <- ts[-c(1,2,3),-c(3)]
+colnames(ts) <- c("date", "X")
+ts$X <- as.numeric(ts$X)
+ts$date <- as.yearmon(ts$date)
+ts <- ts[dim(ts)[1]:1,]
+prod <- zoo(ts$X, order.by = ts$date)
+```
+
+We drop the last two observations for predictions (see after)
+```{r drop}
+prod_train <- prod[1:(length(prod)-2)]
+plot(prod_train, xlab = "Time", ylab = "Values")
+```
+
+
+### Question 2
+
+
+```{r first ACF}
+acf(prod_train, main = "ACF")
+```
+
+```{r second ACF}
+dprod <- diff(prod_train,1)
+acf(dprod, main = "ACF of differenced serie")
+```
+
+```{r LR}
+dvalues <- coredata(dprod)
+
+# dates
+dates <- index(dprod)
+time_num <- as.numeric(dates - dates[1])  # nombre de jours depuis la première date
+df <- data.frame(time = time_num, valeur = dvalues)
+
+reg <- lm(valeur ~ time, data = df)
+summary(reg)
+
+```
+The coefficients are not significant.
+
+```{r first adf}
+adf.test(dvalues)
+```
+the serie seems stationary.
+
+
+
+Let's take a look at two other tests
+
+```{r PP}
+pp.test(x=as.vector(dprod), output=TRUE) #Phillips-Perron test
+kpss.test(x=as.vector(dprod)) #KPSS
+```
+The differenced serie looks stationnary
+
+
+### Question 3
+
+```{r diff1 plot}
+plot(dprod, col = "black", xlab = "Date", ylab = "Valeur X", main = "times serie")
+```
+
+
+## Part II: ARMA Models
+### Question 4
+#### inference for p and q
+
+```{r ACF PACF}
+par(mfrow = c(1, 2))  # 1 ligne, 2 colonnes
+acf(dprod, main = "ACF")
+pacf(dprod, main = "PACF")
+```
+
+
+The ACF and PACF suggest trying *MA(3), MA(5), AR(1)* and mixed ARMA models.
+
+```{r}
+#From the plot we see that
+pmax <- 1
+qmax <- 5
+
+#We create a loop to calculate the AIC/BIC for each possibility in the grid (qmax,pmax)=(1,5)
+mat <- matrix(NA,nrow=pmax+1,ncol=qmax+1) #empty matrix to fill
+rownames(mat) <- paste0("p=",0:pmax) #renames lines
+colnames(mat) <- paste0("q=",0:qmax) #renames columns
+AICs <- mat #AIC matrix not filled non remplie
+BICs <- mat #BIC matrix not filled non remplie
+pqs <- expand.grid(0:pmax,0:qmax) #all possible combinations of p and q
+for (row in 1:dim(pqs)[1]){ #loop for each (p,q)
+  p <- pqs[row,1] #gets p
+  q <- pqs[row,2] #gets q
+  estim <- try(arima(dprod,c(p,0,q),include.mean = F)) #tries ARIMA estimation
+  AICs[p+1,q+1] <- if (class(estim)=="try-error") NA else estim$aic #assigns the AIC
+  BICs[p+1,q+1] <- if (class(estim)=="try-error") NA else BIC(estim) #assigns the BIC
+}
+
+#Print the AICs
+AICs
+AICs==min(AICs)
+```
+
+```{r}
+#The ARIMA(1,1,1) minimizes the AIC. We thus keep it.
+arima111 <- Arima(prod_train, order = c(1,1,1), include.mean = FALSE)
+```
+We keep this model
+
+```{r}
+#Print the BICs
+BICs
+BICs==min(BICs)
+```
+
+Here too the ARIMA(1,1,1) is the best model regarding BIC.
+
+Let's take a deeper look
+We define a function to estimate ARIMA(p,1,q) models and assess their validity based on three criteria: 
+significance of AR and MA coefficients, and absence of residual autocorrelation (via the Ljung-Box test at lag 30). 
+The function returns a vector including the model orders (p, q), test results (arsignif, masignif, resnocorr),
+and an indicator ok equal to 1 if all checks are passed.
+
+The arma_model_choice function applies this procedure to all combinations of (p, q) up to specified maxima (pmax, qmax), and stores the results in the arma_models table. We then extract valid models with ok = 1 into the selection object.
+```{r}
+p_value <- #This function returns the p-values of the estimated ARMA
+  function(estim) {
+    coef <- estim$coef 
+    se <- sqrt(diag(estim$var.coef)) 
+    t <- coef / se 
+    pval <- (1 - pnorm(abs(t)))*2 
+    return(rbind(coef, se, pval))
+  }
+
+model_choice <- #This function estimates an arima and checks the fit and validity of the model with p-value
+  function(p, q, data = dxm, k = 24) {
+    estim <-
+      try(arima(prod_train, c(p, 1, q), optim.control = list(maxit = 20000)))
+    if (class(estim) == "try-error")
+      return(c(
+        "p" = p,
+        "q" = q,
+        "arsignif" = NA,
+        "masignif" = NA,
+        "resnocorr" = NA,
+        "ok" = NA
+      ))
+    arsignif <- if (p == 0) 
+      NA
+    else
+      p_value(estim)[3, p] <= 0.05 
+    masignif <- if (q == 0) 
+      NA
+    else
+      p_value(estim)[3, p + q] <= 0.05 
+    resnocorr <-
+      sum(Box.test(estim$residuals, lag = 30, type = "Ljung-Box")$p.value <= 0.05, na.rm =
+            T) == 0 
+    checks <- c(arsignif, masignif, resnocorr) 
+    ok <-
+      as.numeric(sum(checks, na.rm = T) == (3 - sum(is.na(checks)))) 
+    return(
+      c(
+        "p" = p,
+        "q" = q,
+        "arsignif" = arsignif,
+        "masignif" = masignif,
+        "resnocorr" = resnocorr,
+        "ok" = ok
+      )
+    )
+  }
+
+
+arma_model_choice <- #This function runs the previous one with all p<pmax & q<qmax
+  function(pmax, qmax) {
+    pqs <- expand.grid(0:pmax, 0:qmax) 
+    t(apply(matrix(1:dim(pqs)[1]), 1, function(row) { 
+      p <- pqs[row, 1]
+      q <- pqs[row, 2]
+      cat(paste0("Computing ARMA(", p, ",", q, ") \n"))
+      model_choice(p, q) 
+    }))
+  }
+
+arma_models <- arma_model_choice(pmax, qmax) 
+arma_models
+
+#We only keep models with the column "ok" equals to 1 (significant coefficients & non-autocorrelated residuals) 
+
+selection <- arma_models[arma_models[, "ok"] == 1 & !is.na(arma_models[, "ok"]),] 
+selection 
+```
+```{r}
+# Ljung-Box on residuals
+qtest_arima111 <- sapply(1:24, function(lag) {
+  Box.test(arima111$residuals, lag = lag, type = "Ljung-Box", fitdf = length(arima111$coef) - 1)$p.value
+})
+names(qtest_arima111) <- paste0("Lag_", 1:24)
+print(qtest_arima111)
+```
+Some lags are still significant.
+```{r}
+acf(arima111$residuals, main = "ACF des résidus ARIMA(1,1,1)")
+```
+
+
+Even though the lags are statistically significant, their p-values are very close to the 5% threshold, which suggests the evidence for rejecting the null hypothesis is relatively weak.
+
+```{r}
+coef <- arima111$coef
+se <- sqrt(diag(arima111$var.coef))
+tval <- coef / se
+pval <- 2 * (1 - pnorm(abs(tval)))
+
+results <- data.frame(
+  Coefficient = round(coef, 3),
+  Std.Error = round(se, 3),
+  t.value = round(tval, 3),
+  p.value = round(pval, 3)
+)
+
+kable(results, caption = "Estimated coefficients for ARIMA(1,1,1)")
+```
+
+# Affichage des résultats
+arima111_results <- p_value(arima111)
+knitr::kable(arima111_results, digits = 4, caption = "Estimated coefficients for ARIMA(1,1,1)")
+### QUESTION 8
+
+
+```{r forecast-ellipse, message=FALSE, warning=FALSE, fig.width=6, fig.height=6}
+# Packages
+library(forecast)
+library(ellipse)
+
+
+# Estimation ARIMA(1,1,1)
+arima111 <- Arima(prod_train, order = c(1, 1, 1), include.mean = FALSE)
+arima111
+# Forecast
+fc <- forecast(arima111, h = 2)
+mu <- as.numeric(fc$mean[1:2])
+se <- as.numeric(fc$upper[1:2, 2] - fc$mean[1:2]) / qnorm(0.975)
+# Validity
+stopifnot(length(mu) == 2, length(se) == 2, all(!is.na(se)))
+
+# Cov
+cov_matrix <- matrix(c(se[1]^2, 0, 0, se[2]^2), nrow = 2)
+
+# Ellipse à 95 %
+ell <- ellipse(cov_matrix, centre = mu, level = 0.95, npoints = 100)
+
+# Plot
+plot(ell, type = "l", xlab = expression(X[T+1]), ylab = expression(X[T+2]),
+     main = "95% Confidence Ellipse for (X[T+1], X[T+2])")
+points(mu[1], mu[2], col = "red", pch = 19)
+text(mu[1], mu[2], labels = "Forecast", pos = 4)
+
+```
+
+
+
+```{r final-smooth-legend, message=FALSE, warning=FALSE, fig.width=9, fig.height=5}
+library(forecast)
+library(ggplot2)
+library(dplyr)
+
+# Serie
+prod_train_ts <- ts(prod_train, start = c(1990, 1), frequency = 12)
+
+# ARIMA
+arima111 <- Arima(prod_train_ts, order = c(1,1,1), include.mean = FALSE)
+
+# Prevision
+fc <- forecast(arima111, h = 2)
+
+# Time
+time_observed <- time(prod_train_ts)
+last_time <- time_observed[length(time_observed)]
+time_forecast <- seq(from = last_time + 1/12, by = 1/12, length.out = 2)
+time_full <- c(time_observed, time_forecast)
+
+# Data
+values_full <- c(as.numeric(prod_train_ts), as.numeric(fc$mean))
+lower_95 <- c(rep(NA, length(prod_train_ts)), fc$lower[,"95%"])
+upper_95 <- c(rep(NA, length(prod_train_ts)), fc$upper[,"95%"])
+
+df <- data.frame(
+  Time = time_full,
+  Value = values_full,
+  Lower = lower_95,
+  Upper = upper_95
+)
+
+# Params
+legend_df <- data.frame(
+  Time = c(NA, NA),
+  Value = c(NA, NA),
+  Type = c("Observed", "Forecast")
+)
+
+# Plot
+ggplot() +
+  # Ligne continue noire
+  geom_line(data = df, aes(x = Time, y = Value), color = "black", size = 1) +
+  geom_line(data = df[(nrow(df)-1):nrow(df), ], aes(x = Time, y = Value, color = "Forecast"), size = 1) +
+  geom_ribbon(data = df[(nrow(df)-1):nrow(df), ],
+              aes(x = Time, ymin = Lower, ymax = Upper, fill = "95% CI"),
+              alpha = 0.2) +
+  # Legend
+  scale_color_manual(name = "Series", values = c("Forecast" = "blue")) +
+  scale_fill_manual(name = "", values = c("95% CI" = "blue")) +
+  guides(color = guide_legend(order = 1), fill = guide_legend(order = 2)) +
+  ggtitle("Continuous Forecast with 95% Confidence Interval") +
+  xlab("Time") + ylab("Industrial Production Index") +
+  coord_cartesian(xlim = c(2023.5, 2025.2)) +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+```
